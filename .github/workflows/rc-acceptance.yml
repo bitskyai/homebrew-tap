@@ -1,0 +1,58 @@
+name: RC acceptance
+on: workflow_dispatch
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bitskyai/chatkeeper
+          ref: v0.1.0-rc.1
+      - name: Download shipped artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.1.0-rc.1 -R bitskyai/chatkeeper -p '*darwin_arm64.tar.gz' -p SHA256SUMS -p '*.dmg' -p 'ChatKeeper-*.sha256'
+          shasum -a 256 -c SHA256SUMS --ignore-missing
+          shasum -a 256 -c ChatKeeper-*.sha256 --ignore-missing
+          tar xzf chatkeeper_0.1.0-rc.1_darwin_arm64.tar.gz
+      - name: CLI desktop health
+        run: |
+          ./chatkeeper version
+          mkdir -p "$RUNNER_TEMP/cli"
+          CHATKEEPER_HOME="$RUNNER_TEMP/cli" ./chatkeeper run --mode desktop --bind 127.0.0.1:18787 --no-browser >"$RUNNER_TEMP/cli.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in {1..60}; do curl -fsS http://127.0.0.1:18787/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18787/healthz
+          kill "$pid"; wait "$pid"
+      - name: DMG launch and clean quit
+        run: |
+          hdiutil attach ChatKeeper-0.1.0-rc.1.dmg -mountpoint "$RUNNER_TEMP/dmg"
+          cp -R "$RUNNER_TEMP/dmg/ChatKeeper.app" "$RUNNER_TEMP/ChatKeeper.app"
+          hdiutil detach "$RUNNER_TEMP/dmg"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/ChatKeeper.app"
+          open "$RUNNER_TEMP/ChatKeeper.app"
+          for i in {1..60}; do curl -fsS http://127.0.0.1:8787/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8787/healthz
+          osascript -e 'tell application "ChatKeeper" to quit'
+          for i in {1..30}; do if ! curl -fsS http://127.0.0.1:8787/healthz; then break; fi; sleep 1; done
+          ! curl -fsS http://127.0.0.1:8787/healthz
+          ! pgrep -x ChatKeeper
+      - name: Generated formula and cask install; services
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew tap-new bitskyai/acceptance
+          tap="$(brew --repository bitskyai/acceptance)"
+          python3 scripts/make-formula.py --version 0.1.0-rc.1 --sums SHA256SUMS --out "$tap/Formula/chatkeeper.rb"
+          python3 desktop/macos/scripts/make-cask.py --version 0.1.0-rc.1 --dmg ChatKeeper-0.1.0-rc.1.dmg --out "$tap/Casks/chatkeeper-app.rb" --unsigned
+          brew install --formula bitskyai/acceptance/chatkeeper
+          brew test bitskyai/acceptance/chatkeeper
+          chatkeeper version
+          brew install --cask bitskyai/acceptance/chatkeeper-app
+          brew services start bitskyai/acceptance/chatkeeper
+          trap 'brew services stop bitskyai/acceptance/chatkeeper' EXIT
+          for i in {1..60}; do curl -fsS http://127.0.0.1:8787/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8787/healthz
+          brew services stop bitskyai/acceptance/chatkeeper
